@@ -27,7 +27,7 @@ func TestRobustRequest(t *testing.T) {
 				ListenTimeout:           100 * time.Millisecond,
 			},
 			wantInnerRequestsAmount: 1,
-			wantMessages:            []Message{},
+			wantMessages:            nil,
 			wantErrors:              []error{nil},
 		},
 		{
@@ -207,22 +207,25 @@ func TestRobustRequest(t *testing.T) {
 			}
 
 			mock := tt.mock.create(ctx)
-			cl, err := (&RobustConfig{Inner: mock, AutoRefresh: tt.autoRefresh}).Create(ctx)
+			client, err := (&RobustConfig{Inner: mock, AutoRefresh: tt.autoRefresh}).Create(ctx)
 			if err != nil {
 				t.Errorf("Create() error = %v", err)
 				return
 			}
 
-			gotMessages, gotErrors := tt.tester.RequestMessages(cl, &Request{
+			listenCtx, listenCancel := context.WithTimeout(ctx, tt.tester.ListenTimeout)
+			defer listenCancel()
+
+			gotMessages, err := ListenSliceRawMessages(listenCtx, client, &Request{
 				Ctx:        ctx,
-				BufferSize: DefaultWsBuffSize,
-			})
+				BufferSize: DefaultBuffSize,
+			}, uint(tt.tester.ListenMessagesMaxAmount))
+			if err != nil {
+				t.Errorf("ListenSliceRawMessages() error got = %v, want nil", err)
+			}
 
 			if gotLen := len(mock.Requests()); gotLen != tt.wantInnerRequestsAmount {
 				t.Errorf("len(mock.Requests()) got = %v, want %v", gotLen, tt.wantInnerRequestsAmount)
-			}
-			if !reflect.DeepEqual(gotErrors, tt.wantErrors) {
-				t.Errorf("Request().Listen() errors got = %v, want %v", gotErrors, tt.wantErrors)
 			}
 			if !reflect.DeepEqual(gotMessages, tt.wantMessages) {
 				t.Errorf("Request().Listen() messages got = %v, want %v", gotMessages, tt.wantMessages)

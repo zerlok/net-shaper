@@ -66,9 +66,9 @@ type robust struct {
 
 func (c *robust) Request(req *Request) (RawResponse, error) {
 	resCtx, resCancel := context.WithCancel(req.Context())
-	responses := make(chan RawResponse, 1)
+	responsesForIncoming := make(chan RawResponse, 1)
+	responsesForOutgoing := make(chan RawResponse, 1)
 	incomingMessages := make(chan Message, req.BufferSize)
-	// TODO: close channel
 	outgoingMessages := make(chan Message, req.BufferSize)
 
 	res := &robustResponse{
@@ -82,9 +82,10 @@ func (c *robust) Request(req *Request) (RawResponse, error) {
 	}
 
 	defer c.responsesWg.Add(1)
-	defer res.workersWg.Add(2)
-	go res.produceUnderlying(req, &c.autoRefresh, responses)
-	go res.forwardMessages(responses, incomingMessages, outgoingMessages)
+	defer res.workersWg.Add(3)
+	go res.produceUnderlying(req, &c.autoRefresh, responsesForOutgoing, responsesForIncoming)
+	go res.forwardOutgoingMessages(responsesForOutgoing, outgoingMessages)
+	go res.forwardIncomingMessages(responsesForIncoming, incomingMessages)
 
 	return res, nil
 }
@@ -135,12 +136,14 @@ func (r *robustResponse) Err() error {
 func (r *robustResponse) Close(_ context.Context) {
 	defer r.responseWg.Done()
 	defer r.workersWg.Wait()
+	defer close(r.outgoingMessages)
 	r.cancel()
 }
 
-func (r *robustResponse) produceUnderlying(req *Request, autoRefresh *timer.Ticker, responses chan<- RawResponse) {
+func (r *robustResponse) produceUnderlying(req *Request, autoRefresh *timer.Ticker, responsesForOutgoing, responsesForIncoming chan<- RawResponse) {
 	defer r.workersWg.Done()
-	defer close(responses)
+	defer close(responsesForOutgoing)
+	defer close(responsesForIncoming)
 
 	for ok := true; ok; {
 		res, err := r.createUnderlying(req)
@@ -148,7 +151,8 @@ func (r *robustResponse) produceUnderlying(req *Request, autoRefresh *timer.Tick
 			return
 		}
 
-		responses <- res
+		responsesForOutgoing <- res
+		responsesForIncoming <- res
 
 		ok = r.handleUnderlying(res, autoRefresh)
 	}
@@ -189,12 +193,62 @@ func (r *robustResponse) handleUnderlying(res RawResponse, autoRefresh *timer.Ti
 	return
 }
 
-func (r *robustResponse) forwardMessages(responses <-chan RawResponse, incomingMessages chan<- Message, outgoingMessages <-chan Message) {
+func (r *robustResponse) forwardOutgoingMessages(responses <-chan RawResponse, outgoingMessages <-chan Message) {
+	defer r.workersWg.Done()
+
+	pool := make(chan RawResponse, 1)
+
+	go func() {
+		defer close(pool)
+		for {
+			select {
+			case <-r.clientCtx.Done():
+				return
+			case <-r.ctx.Done():
+				return
+			case res := <-responses:
+				select {
+				case _, ok := <-pool:
+					if !ok {
+						return
+					}
+				default:
+					pool <- res
+				}
+			}
+		}
+	}()
+
+	for msg := range outgoingMessages {
+		var err error
+		for ok := false; !ok; ok = err == nil {
+			select {
+			case <-r.clientCtx.Done():
+				return
+			case <-r.ctx.Done():
+				return
+			case res := <-pool:
+				pool <- res
+				err = res.Send(msg)
+				if err != nil {
+					select {
+					case <-res.Closed():
+						continue
+					default:
+						res.Close(r.ctx)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (r *robustResponse) forwardIncomingMessages(responses <-chan RawResponse, incomingMessages chan<- Message) {
 	defer r.workersWg.Done()
 	defer close(incomingMessages)
 
 	for res := range responses {
-		var in Message
+		var msg Message
 
 		for ok := true; ok; {
 			select {
@@ -202,15 +256,9 @@ func (r *robustResponse) forwardMessages(responses <-chan RawResponse, incomingM
 				return
 			case <-r.ctx.Done():
 				return
-			case out := <-outgoingMessages:
-				// TODO: retry sending until it succeeds
-				err := res.Send(out)
-				if err != nil {
-					res.Close(r.ctx)
-				}
-			case in, ok = <-res.Listen():
+			case msg, ok = <-res.Listen():
 				if ok {
-					incomingMessages <- in
+					incomingMessages <- msg
 				}
 			}
 		}

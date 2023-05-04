@@ -23,7 +23,7 @@ func (t *Tester) RunMessages(ctx context.Context, cl Client) (messages []Message
 		factory = func(_ uint) *Request {
 			return &Request{
 				Ctx:        ctx,
-				BufferSize: DefaultWsBuffSize,
+				BufferSize: DefaultBuffSize,
 			}
 		}
 	}
