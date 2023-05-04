@@ -12,10 +12,11 @@ import (
 )
 
 const (
-	DefaultWsProtocol       = ""
-	DefaultWsOrigin         = "http://localhost"
-	DefaultWsReceiveTimeout = time.Duration(0)
-	DefaultWsBuffSize       = uint(128)
+	DefaultProtocol       = ""
+	DefaultOrigin         = "http://localhost"
+	DefaultSendTimeout    = time.Duration(0)
+	DefaultReceiveTimeout = time.Duration(0)
+	DefaultBuffSize       = uint(128)
 )
 
 func NewNet(opts ...conf.Option[NetConfig]) conf.Option[Config] {
@@ -43,6 +44,13 @@ func WithNetOrigin(origin string) conf.Option[NetConfig] {
 	})
 }
 
+func WithNetSendTimeout(timeout time.Duration) conf.Option[NetConfig] {
+	return conf.OptionFunc[NetConfig](func(config NetConfig) NetConfig {
+		config.SendTimeout = timeout
+		return config
+	})
+}
+
 func WithNetReceiveTimeout(timeout time.Duration) conf.Option[NetConfig] {
 	return conf.OptionFunc[NetConfig](func(config NetConfig) NetConfig {
 		config.ReceiveTimeout = timeout
@@ -62,6 +70,7 @@ var _ Config = (*NetConfig)(nil)
 type NetConfig struct {
 	Protocol       string
 	Origin         string
+	SendTimeout    time.Duration
 	ReceiveTimeout time.Duration
 	BufferSize     uint
 }
@@ -71,19 +80,23 @@ func (c *NetConfig) Create(ctx context.Context) (Client, error) {
 
 	protocol := c.Protocol
 	if protocol == "" {
-		protocol = DefaultWsProtocol
+		protocol = DefaultProtocol
 	}
 	origin := c.Origin
 	if origin == "" {
-		origin = DefaultWsOrigin
+		origin = DefaultOrigin
+	}
+	sendTimeout := c.SendTimeout
+	if sendTimeout == 0 {
+		sendTimeout = DefaultSendTimeout
 	}
 	receiveTimeout := c.ReceiveTimeout
 	if receiveTimeout == 0 {
-		receiveTimeout = DefaultWsReceiveTimeout
+		receiveTimeout = DefaultReceiveTimeout
 	}
 	buffSize := c.BufferSize
 	if buffSize == 0 {
-		buffSize = DefaultWsBuffSize
+		buffSize = DefaultBuffSize
 	}
 
 	return &netClient{
@@ -91,6 +104,7 @@ func (c *NetConfig) Create(ctx context.Context) (Client, error) {
 		cancel:         cancel,
 		protocol:       protocol,
 		origin:         origin,
+		sendTimeout:    sendTimeout,
 		receiveTimeout: receiveTimeout,
 		bufferSize:     buffSize,
 	}, nil
@@ -104,6 +118,7 @@ type netClient struct {
 	responsesWg    sync.WaitGroup
 	protocol       string
 	origin         string
+	sendTimeout    time.Duration
 	receiveTimeout time.Duration
 	bufferSize     uint
 }
@@ -144,12 +159,14 @@ func (c *netClient) Request(req *Request) (res RawResponse, err error) {
 
 	wsResCtx, wsResCancel := context.WithCancel(req.Context())
 	wsRes := &netResponse{
-		clientCtx:  c.ctx,
-		ctx:        wsResCtx,
-		cancel:     wsResCancel,
-		responseWg: &c.responsesWg,
-		conn:       conn,
-		messages:   make(chan Message, buffSize),
+		clientCtx:      c.ctx,
+		ctx:            wsResCtx,
+		cancel:         wsResCancel,
+		responseWg:     &c.responsesWg,
+		conn:           conn,
+		sendTimeout:    c.sendTimeout,
+		receiveTimeout: c.receiveTimeout,
+		messages:       make(chan Message, buffSize),
 	}
 
 	defer c.responsesWg.Add(1)
@@ -172,15 +189,24 @@ type netResponse struct {
 	cancel         context.CancelFunc
 	responseWg     *sync.WaitGroup
 	conn           *websocket.Conn
+	sendTimeout    time.Duration
 	receiveTimeout time.Duration
 	messages       chan Message
 	err            error
 	wg             sync.WaitGroup
 }
 
-func (r *netResponse) Send(message Message) error {
-	_, err := r.conn.Write(message.Buff())
-	return err
+func (r *netResponse) Send(message Message) (err error) {
+	if r.sendTimeout > 0 {
+		err = r.conn.SetWriteDeadline(time.Now().Add(r.sendTimeout))
+		if err != nil {
+			return
+		}
+	}
+
+	_, err = r.conn.Write(message.Buff())
+
+	return
 }
 
 func (r *netResponse) Listen() <-chan Message {
